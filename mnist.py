@@ -1,328 +1,246 @@
-import sys
 import os
+import pygame
 import numpy as np
-from PIL import Image, ImageDraw, ImageOps
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torchvision
-import torchvision.transforms as transforms
-from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QPushButton, QLabel, QSpinBox, QComboBox, QProgressBar)
-from PyQt6.QtGui import QPainter, QPen, QColor, QImage
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+import warnings
+from sklearn.datasets import fetch_openml
+from sklearn.neural_network import MLPClassifier
+from sklearn.exceptions import ConvergenceWarning
 
-# Cihaz ayarı (Mac kullandığın için varsa mps yoksa cpu)
-device = torch.device("cpu")
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.join(BASE_DIR, "models")
-if not os.path.exists(MODELS_DIR):
-    os.makedirs(MODELS_DIR)
+def get_saved_models():
+    models = []
+    for f in os.listdir():
+        if f.startswith("mnist_weights_") and f.endswith(".npz"):
+            parts = f.replace("mnist_weights_", "").replace(".npz", "").split("_")
+            if len(parts) == 3:
+                models.append((int(parts[0]), int(parts[1]), int(parts[2]), f))
+    return sorted(models)
 
-class Net(nn.Module):
-    def __init__(self, input_size):
-        super().__init__()
-        self.l1 = nn.Linear(input_size, 512)
-        self.l2 = nn.Linear(512, 256)
-        self.l3 = nn.Linear(256, 128)
-        self.l4 = nn.Linear(128, 10)
-        self.relu = nn.ReLU()
+def load_or_train_model(h1, h2, max_iter, force=False):
+    weight_file = f"mnist_weights_{h1}_{h2}_{max_iter}.npz"
+    if not force and os.path.exists(weight_file):
+        try:
+            data = np.load(weight_file, allow_pickle=True)
+            return data['weights'], data['biases']
+        except Exception:
+            os.remove(weight_file)
+    
+    X, y = fetch_openml('mnist_784', version=1, return_X_y=True, as_frame=False, parser='auto')
+    X = X / 255.0
+    
+    mlp = MLPClassifier(hidden_layer_sizes=(h1, h2), activation='logistic', max_iter=max_iter, random_state=42)
+    mlp.fit(X[:35000], y[:35000])
+    
+    weights_obj = np.array(mlp.coefs_, dtype=object)
+    biases_obj = np.array(mlp.intercepts_, dtype=object)
+    
+    np.savez(weight_file, weights=weights_obj, biases=biases_obj)
+    return weights_obj, biases_obj
+
+def center_image(grid):
+    if np.sum(grid) == 0: return grid
+    y_coords, x_coords = np.nonzero(grid)
+    y_min, y_max, x_min, x_max = np.min(y_coords), np.max(y_coords), np.min(x_coords), np.max(x_coords)
+    cropped = grid[y_min:y_max+1, x_min:x_max+1]
+    h, w = cropped.shape
+    centered = np.zeros((28, 28))
+    centered[(28-h)//2 : (28-h)//2+h, (28-w)//2 : (28-w)//2+w] = cropped
+    return centered
+
+class NeuralNetwork:
+    def __init__(self, h1=32, h2=32, iters=100, force=False):
+        self.weights, self.biases = load_or_train_model(h1, h2, iters, force)
+        self.activations = []
+
+    def sigmoid(self, z): return 1 / (1 + np.exp(-np.clip(z, -250, 250)))
+    def softmax(self, z):
+        ex = np.exp(z - np.max(z))
+        return ex / ex.sum()
+
+    def forward(self, input_data):
+        self.activations = [input_data.flatten()]
+        curr = self.activations[0]
+        for i in range(len(self.weights)):
+            z = np.dot(curr, self.weights[i]) + self.biases[i]
+            curr = self.softmax(z) if i == len(self.weights)-1 else self.sigmoid(z)
+            self.activations.append(curr)
+        return curr
+
+class App:
+    def __init__(self):
+        pygame.init()
+        self.info = pygame.display.Info()
+        self.w, self.h = self.info.current_w, self.info.current_h
+        self.screen = pygame.display.set_mode((self.w, self.h), pygame.FULLSCREEN)
+        self.clock = pygame.time.Clock()
+        self.font_xs = pygame.font.SysFont("Courier New", 10, bold=True)
+        self.font_sm = pygame.font.SysFont("Courier New", 14, bold=True)
+        self.font_md = pygame.font.SysFont("Courier New", 18, bold=True)
+        self.font_lg = pygame.font.SysFont("Courier New", 28, bold=True)
         
-    def forward(self, x, return_activations=False):
-        a1 = self.relu(self.l1(x))
-        a2 = self.relu(self.l2(a1))
-        a3 = self.relu(self.l3(a2))
-        out = self.l4(a3)
-        if return_activations:
-            return out, [a1, a2, a3, out]
-        return out
+        self.h1_val, self.h2_val, self.iter_val = 32, 32, 100
+        self.is_training = self.is_loading = self.show_settings = self.show_info = False
+        self.saved_models = get_saved_models()
+        self.selected_model_idx = 0
 
-def save_npz(model, path, img_size):
-    data = {k: v.cpu().numpy() for k, v in model.state_dict().items()}
-    data["img_size"] = np.array([img_size])
-    np.savez(path, **data)
+        self.grid = np.zeros((28, 28))
+        self.nn = NeuralNetwork(self.h1_val, self.h2_val, self.iter_val)
+        
+        self.canvas_size = int(self.h * 0.33)
+        self.grid_cell = self.canvas_size // 28
+        self.canvas_rect = pygame.Rect((self.w//2 - self.canvas_size//2), int(self.h * 0.65), self.canvas_size, self.canvas_size)
+        
+        self.bg_color, self.grid_color, self.accent_color = (4, 6, 8), (15, 20, 30), (0, 255, 170)
+        self.dim_color, self.text_color, self.alert_color = (25, 35, 45), (140, 160, 180), (255, 40, 40)
 
-def load_npz(path):
-    data = np.load(path)
-    img_size = int(data["img_size"][0])
-    model = Net(img_size * img_size)
-    state = {k: torch.tensor(data[k]) for k in model.state_dict().keys()}
-    model.load_state_dict(state)
-    model.eval()
-    return model, img_size
+        self.btn_opt = pygame.Rect(30, self.h - 70, 120, 45)
+        self.btn_info = pygame.Rect(160, self.h - 70, 45, 45)
+        self.panel_rect = pygame.Rect(30, self.h - 520, 360, 440)
+        
+        self.btn_h1_sub, self.btn_h1_add = pygame.Rect(220, self.panel_rect.y+60, 30, 30), pygame.Rect(310, self.panel_rect.y+60, 30, 30)
+        self.btn_h2_sub, self.btn_h2_add = pygame.Rect(220, self.panel_rect.y+110, 30, 30), pygame.Rect(310, self.panel_rect.y+110, 30, 30)
+        self.btn_it_sub, self.btn_it_add = pygame.Rect(220, self.panel_rect.y+160, 30, 30), pygame.Rect(310, self.panel_rect.y+160, 30, 30)
+        self.btn_apply = pygame.Rect(50, self.panel_rect.y+210, 290, 45)
+        self.btn_model_prev, self.btn_model_next = pygame.Rect(50, self.panel_rect.y+320, 35, 35), pygame.Rect(305, self.panel_rect.y+320, 35, 35)
+        self.btn_load = pygame.Rect(50, self.panel_rect.y+370, 290, 45)
 
-class TrainThread(QThread):
-    progress = pyqtSignal(int)
-    finished_train = pyqtSignal(object)
+    def draw_ui(self):
+        self.screen.fill(self.bg_color)
+        for x in range(0, self.w, 60): pygame.draw.line(self.screen, self.grid_color, (x, 0), (x, self.h), 1)
+        for y in range(0, self.h, 60): pygame.draw.line(self.screen, self.grid_color, (0, y), (self.w, y), 1)
+        self.screen.blit(self.font_md.render("[ESC] EXIT", True, self.alert_color), (self.w - 140, 20))
 
-    def __init__(self, img_size, epochs):
-        super().__init__()
-        self.img_size = img_size
-        self.epochs = epochs
+        pygame.draw.rect(self.screen, (2, 4, 6), self.canvas_rect)
+        for y in range(28):
+            for x in range(28):
+                if self.grid[y, x] > 0:
+                    c = int(self.grid[y, x] * 255)
+                    pygame.draw.rect(self.screen, (0, c, int(c*0.6)), (self.canvas_rect.x + x*self.grid_cell, self.canvas_rect.y + y*self.grid_cell, self.grid_cell, self.grid_cell))
+        pygame.draw.rect(self.screen, self.accent_color, self.canvas_rect, 1)
+
+        pygame.draw.rect(self.screen, self.dim_color, self.btn_opt, 1)
+        self.screen.blit(self.font_md.render("OPTIONS", True, self.accent_color if self.show_settings else self.text_color), (self.btn_opt.x+20, self.btn_opt.y+12))
+        pygame.draw.rect(self.screen, self.dim_color, self.btn_info, 1)
+        self.screen.blit(self.font_md.render("?", True, self.accent_color if self.show_info else self.text_color), (self.btn_info.x+15, self.btn_info.y+12))
+
+        if self.show_info:
+            p = pygame.Rect(160, self.h - 140, 420, 65)
+            pygame.draw.rect(self.screen, (10, 15, 25), p); pygame.draw.rect(self.screen, self.accent_color, p, 1)
+            self.screen.blit(self.font_sm.render("LMB: WRITE | RMB: PURGE | [C]: CLEAR SURFACE", True, self.text_color), (p.x+15, p.y+22))
+
+        if self.show_settings:
+            pygame.draw.rect(self.screen, (8, 12, 18), self.panel_rect); pygame.draw.rect(self.screen, self.accent_color, self.panel_rect, 1)
+            self.screen.blit(self.font_md.render("NEURAL ARCHITECTURE", True, self.accent_color), (50, self.panel_rect.y+15))
+            cfg = [("L2 WIDTH", self.h1_val, self.btn_h1_sub), ("L3 WIDTH", self.h2_val, self.btn_h2_sub), ("MAX ITER", self.iter_val, self.btn_it_sub)]
+            for lbl, v, b in cfg:
+                self.screen.blit(self.font_sm.render(lbl, True, self.text_color), (50, b.y+8))
+                pygame.draw.rect(self.screen, self.dim_color, b, 1); pygame.draw.rect(self.screen, self.dim_color, (b.x+90, b.y, 30, 30), 1)
+                self.screen.blit(self.font_md.render("-", True, self.accent_color), (b.x+10, b.y+5)); self.screen.blit(self.font_md.render("+", True, self.accent_color), (b.x+100, b.y+5))
+                self.screen.blit(self.font_md.render(str(v), True, self.accent_color), (b.x+40, b.y+5))
+            pygame.draw.rect(self.screen, self.dim_color, self.btn_apply, 1)
+            self.screen.blit(self.font_md.render("RE-TRAIN ENGINE", True, self.accent_color), (self.btn_apply.x+60, self.btn_apply.y+12))
+            self.screen.blit(self.font_md.render("LOCAL WEIGHTS", True, self.accent_color), (50, self.panel_rect.y+285))
+            pygame.draw.rect(self.screen, self.dim_color, self.btn_model_prev, 1); pygame.draw.rect(self.screen, self.dim_color, self.btn_model_next, 1)
+            self.screen.blit(self.font_md.render("<", True, self.accent_color), (self.btn_model_prev.x+12, self.btn_model_prev.y+6))
+            self.screen.blit(self.font_md.render(">", True, self.accent_color), (self.btn_model_next.x+12, self.btn_model_next.y+6))
+            if self.saved_models:
+                m = self.saved_models[self.selected_model_idx]
+                self.screen.blit(self.font_sm.render(f"H:{m[0]}-{m[1]} I:{m[2]}", True, self.accent_color), (self.btn_model_prev.x+55, self.btn_model_prev.y+10))
+            pygame.draw.rect(self.screen, self.dim_color, self.btn_load, 1)
+            self.screen.blit(self.font_md.render("DEPLOY SELECTED", True, self.accent_color), (self.btn_load.x+70, self.btn_load.y+12))
+
+    def draw_network(self):
+        if not self.nn.activations: return
+        labels = ["L1: SENSOR", "L2: HIDDEN", "L3: HIDDEN", "L4: OUTPUT"]
+        margin = int(self.w * 0.12)
+        layer_x = [margin + i * ((self.w - 2*margin) // 3) for i in range(4)]
+        n_h, y_o = int(self.h * 0.58), int(self.h * 0.06)
+        
+        for i in range(3):
+            act_c, act_n = self.nn.activations[i], self.nn.activations[i+1]
+            if i == 0: idx_c = np.linspace(0, len(act_c)-1, 32, dtype=int)
+            else: idx_c = np.arange(len(act_c))
+            
+            idx_n = np.arange(len(act_n))
+            sp_c, sp_n = n_h / max(1, len(idx_c)), n_h / max(1, len(idx_n))
+            ys_c, ys_n = y_o + (n_h - len(idx_c)*sp_c)/2, y_o + (n_h - len(idx_n)*sp_n)/2
+            
+            line_limit = 5000 
+            line_count = 0
+            for n1, i1 in enumerate(idx_c):
+                if act_c[i1] > 0.15:
+                    y1 = ys_c + n1*sp_c
+                    for n2, i2 in enumerate(idx_n):
+                        if line_count < line_limit:
+                            pygame.draw.line(self.screen, (25, 40, 50), (layer_x[i], y1), (layer_x[i+1], ys_n + n2*sp_n), 1)
+                            line_count += 1
+
+        for i, x in enumerate(layer_x):
+            act = self.nn.activations[i]
+            if i == 0: idx_list = np.linspace(0, len(act)-1, 32, dtype=int)
+            else: idx_list = np.arange(len(act))
+            
+            sp = n_h / max(1, len(idx_list))
+            ys = y_o + (n_h - len(idx_list)*sp)/2
+            r = max(1, min(6, int(sp // 2) - 1))
+            self.screen.blit(self.font_sm.render(labels[i], True, self.accent_color), (x - 40, y_o - 25))
+            
+            for j, idx in enumerate(idx_list):
+                v = float(act[idx])
+                color = (int(v*self.accent_color[0]+(1-v)*self.dim_color[0]), int(v*self.accent_color[1]+(1-v)*self.dim_color[1]), int(v*self.accent_color[2]+(1-v)*self.dim_color[2]))
+                pygame.draw.circle(self.screen, color, (x, int(ys + j*sp)), r)
+                if v > 0.6: pygame.draw.circle(self.screen, self.accent_color, (x, int(ys + j*sp)), r+2, 1)
+                if i == 3:
+                    self.screen.blit(self.font_md.render(f"[{idx}]", True, self.accent_color if v > 0.5 else self.dim_color), (x+15, int(ys+j*sp-10)))
+                    if v > 0.1: self.screen.blit(self.font_xs.render(f"{v*100:04.1f}%", True, self.text_color), (x+55, int(ys+j*sp-5)))
+
+    def handle_input(self):
+        p, b = pygame.mouse.get_pos(), pygame.mouse.get_pressed()
+        if self.canvas_rect.collidepoint(p) and not self.show_settings:
+            x, y = (p[0]-self.canvas_rect.x)//self.grid_cell, (p[1]-self.canvas_rect.y)//self.grid_cell
+            if b[0]:
+                self.grid[y, x] = 1.0
+                for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
+                    if 0<=y+dy<28 and 0<=x+dx<28: self.grid[y+dy, x+dx] = min(1.0, self.grid[y+dy, x+dx]+0.5)
+            elif b[2]: self.grid[y, x] = 0.0
 
     def run(self):
-        transform = transforms.Compose([
-            transforms.Resize((self.img_size, self.img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,))
-        ])
-        trainset = torchvision.datasets.MNIST(root=os.path.join(BASE_DIR, "data"), 
-                                              train=True, download=True, transform=transform)
-        loader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True)
-        
-        model = Net(self.img_size * self.img_size).to(device)
-        opt = optim.Adam(model.parameters(), lr=0.001)
-        loss_fn = nn.CrossEntropyLoss()
-        
-        total_steps = len(loader) * self.epochs
-        step = 0
-        
-        for e in range(self.epochs):
-            for x, y in loader:
-                x = x.view(-1, self.img_size * self.img_size).to(device)
-                y = y.to(device)
-                opt.zero_grad()
-                loss = loss_fn(model(x), y)
-                loss.backward()
-                opt.step()
-                
-                step += 1
-                if step % 20 == 0:
-                    self.progress.emit(int((step / total_steps) * 100))
-                    
-        model.eval()
-        self.progress.emit(100)
-        self.finished_train.emit(model)
+        while True:
+            for e in pygame.event.get():
+                if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE): return
+                if e.type == pygame.KEYDOWN and e.key == pygame.K_c: self.grid = np.zeros((28, 28))
+                if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                    m = pygame.mouse.get_pos()
+                    if self.btn_opt.collidepoint(m): self.show_settings = not self.show_settings
+                    elif self.btn_info.collidepoint(m): self.show_info = not self.show_info
+                    elif self.show_settings:
+                        if self.btn_h1_sub.collidepoint(m): self.h1_val = max(8, self.h1_val-8)
+                        elif self.btn_h1_add.collidepoint(m): self.h1_val = min(512, self.h1_val+8)
+                        elif self.btn_h2_sub.collidepoint(m): self.h2_val = max(8, self.h2_val-8)
+                        elif self.btn_h2_add.collidepoint(m): self.h2_val = min(512, self.h2_val+8)
+                        elif self.btn_it_sub.collidepoint(m): self.iter_val = max(50, self.iter_val-50)
+                        elif self.btn_it_add.collidepoint(m): self.iter_val = min(2000, self.iter_val+50)
+                        elif self.btn_apply.collidepoint(m): self.is_training = True
+                        elif self.saved_models:
+                            if self.btn_model_prev.collidepoint(m): self.selected_model_idx = (self.selected_model_idx-1)%len(self.saved_models)
+                            elif self.btn_model_next.collidepoint(m): self.selected_model_idx = (self.selected_model_idx+1)%len(self.saved_models)
+                            elif self.btn_load.collidepoint(m): self.is_loading = True
+            if self.is_training or self.is_loading:
+                self.screen.fill(self.bg_color)
+                self.screen.blit(self.font_lg.render("NEURAL CORE SYNCING...", True, self.accent_color), (self.w//2-250, self.h//2))
+                pygame.display.flip()
+                if self.is_training: self.nn = NeuralNetwork(self.h1_val, self.h2_val, self.iter_val, True)
+                else:
+                    c = self.saved_models[self.selected_model_idx]
+                    self.h1_val, self.h2_val, self.iter_val = c[0], c[1], c[2]
+                    self.nn = NeuralNetwork(self.h1_val, self.h2_val, self.iter_val)
+                self.saved_models, self.grid, self.is_training, self.is_loading, self.show_settings = get_saved_models(), np.zeros((28, 28)), False, False, False
+            else:
+                self.handle_input()
+                self.nn.forward(center_image(self.grid).flatten())
+                self.draw_ui(); self.draw_network()
+                pygame.display.flip(); self.clock.tick(60)
 
-def center_image(img):
-    img = img.convert("L")
-    img_inv = ImageOps.invert(img) # Beyaz arka planı siyaha çevir (MNIST formatı)
-    bbox = img_inv.getbbox()
-    if not bbox: return img_inv
-    
-    digit = img_inv.crop(bbox)
-    w, h = digit.size
-    m = max(w, h) + 24 # Rakamın etrafına boşluk bırak
-    new = Image.new("L", (m, m), 0)
-    new.paste(digit, ((m - w) // 2, (m - h) // 2))
-    return new
-
-class NetworkVizWidget(QWidget):
-    def __init__(self, w, h):
-        super().__init__()
-        self.setFixedSize(w, h)
-        self.layer_sizes = [10, 8, 8, 8, 10]
-        self.activations = [[0]*size for size in self.layer_sizes]
-
-    def update_activations(self, acts):
-        if not acts: return
-        self.activations[0] = [np.random.rand() * 0.4 for _ in range(self.layer_sizes[0])]
-        for i, act in enumerate(acts):
-            act_np = act.detach().cpu().numpy()[0]
-            if len(act_np) > 0:
-                act_np = (act_np - act_np.min()) / (act_np.max() - act_np.min() + 1e-5)
-                self.activations[i+1] = act_np[:self.layer_sizes[i+1]]
-        self.update()
-
-    def reset(self):
-        self.activations = [[0]*size for size in self.layer_sizes]
-        self.update()
-
-    def paintEvent(self, e):
-        painter = QPainter(self)
-        painter.fillRect(0, 0, self.width(), self.height(), QColor(25, 25, 25))
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        margin_x, nodes = 40, []
-        spacing_x = (self.width() - 2 * margin_x) / (len(self.layer_sizes) - 1)
-        for i, size in enumerate(self.layer_sizes):
-            layer_nodes = []
-            x = margin_x + i * spacing_x
-            spacing_y = self.height() / (size + 1)
-            for j in range(size):
-                layer_nodes.append((x, (j + 1) * spacing_y, self.activations[i][j]))
-            nodes.append(layer_nodes)
-        
-        painter.setPen(QPen(QColor(70, 70, 70, 100), 1))
-        for i in range(len(nodes) - 1):
-            for n1 in nodes[i]:
-                for n2 in nodes[i+1]:
-                    painter.drawLine(int(n1[0]), int(n1[1]), int(n2[0]), int(n2[1]))
-        
-        for layer in nodes:
-            for x, y, act in layer:
-                intensity = int(act * 200) + 55
-                painter.setBrush(QColor(intensity, intensity // 2, 0) if act > 0.05 else QColor(45, 45, 45))
-                painter.setPen(QPen(QColor(200, 200, 200), 1))
-                painter.drawEllipse(int(x - 7), int(y - 7), 14, 14)
-
-class VizWidget(QWidget):
-    def __init__(self, w, h):
-        super().__init__()
-        self.setFixedSize(w, h)
-        self.probs = [0] * 10
-        self.pred = 0
-    def update_probs(self, pred, probs):
-        self.pred, self.probs = pred, probs
-        self.update()
-    def reset(self):
-        self.probs, self.pred = [0] * 10, 0
-        self.update()
-    def paintEvent(self, e):
-        painter = QPainter(self)
-        painter.fillRect(0, 0, self.width(), self.height(), QColor(35, 35, 35))
-        bw = self.width() / 10
-        for i, p in enumerate(self.probs):
-            h = p * (self.height() - 60)
-            x, y = i * bw + 6, self.height() - h - 35
-            painter.setBrush(QColor(0, 255, 150) if i == self.pred else QColor(80, 80, 120))
-            painter.drawRect(int(x), int(y), int(bw - 12), int(h))
-            painter.setPen(QColor(255, 255, 255))
-            painter.drawText(int(x + bw/4), int(self.height() - 12), str(i))
-
-class DrawWidget(QWidget):
-    def __init__(self, w, h, parent):
-        super().__init__()
-        self.parent = parent
-        self.setFixedSize(w, h)
-        self.image = QImage(w, h, QImage.Format.Format_RGB32)
-        self.image.fill(Qt.GlobalColor.white)
-        self.last = None
-        self.pil_img = Image.new("L", (w, h), "white")
-        self.pil_draw = ImageDraw.Draw(self.pil_img)
-        
-    def mousePressEvent(self, e): self.last = e.position().toPoint()
-    def mouseMoveEvent(self, e):
-        if self.last:
-            p = e.position().toPoint()
-            painter = QPainter(self.image)
-            pen = QPen(Qt.GlobalColor.black, 24, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-            painter.setPen(pen)
-            painter.drawLine(self.last, p)
-            painter.end()
-            self.pil_draw.line([self.last.x(), self.last.y(), p.x(), p.y()], fill=0, width=24)
-            self.last = p
-            self.update()
-            self.parent.realtime_predict()
-    def mouseReleaseEvent(self, e): self.last = None
-    def paintEvent(self, e):
-        p = QPainter(self)
-        p.drawImage(0, 0, self.image)
-        p.setPen(QPen(QColor(120, 120, 120), 2))
-        p.drawRect(0, 0, self.width()-1, self.height()-1)
-    def clear(self):
-        self.image.fill(Qt.GlobalColor.white)
-        self.pil_img = Image.new("L", (self.width(), self.height()), "white")
-        self.pil_draw = ImageDraw.Draw(self.pil_img)
-        self.update()
-
-class Main(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("MNIST Visualizer")
-        self.setStyleSheet("background-color: #1a1a1a; color: #eeeeee;")
-        
-        main_layout = QVBoxLayout()
-        
-        # Üst Panel (Grafikler)
-        top_layout = QHBoxLayout()
-        self.viz = VizWidget(450, 250)
-        self.net_viz = NetworkVizWidget(450, 250)
-        top_layout.addWidget(self.viz)
-        top_layout.addWidget(self.net_viz)
-        main_layout.addLayout(top_layout)
-        
-        # Orta Panel (Çizim)
-        draw_layout = QHBoxLayout()
-        self.draw = DrawWidget(320, 320, self)
-        draw_layout.addStretch()
-        draw_layout.addWidget(self.draw)
-        draw_layout.addStretch()
-        main_layout.addLayout(draw_layout)
-
-        # ALT KISIM: Progress Bar (Klavuz altta bar şeklinde)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedHeight(12)
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.setStyleSheet("""
-            QProgressBar { background-color: #333; border-radius: 6px; }
-            QProgressBar::chunk { background-color: #00ccff; border-radius: 6px; }
-        """)
-        main_layout.addWidget(QLabel("Training Progress:"))
-        main_layout.addWidget(self.progress_bar)
-        
-        # Kontroller
-        controls = QHBoxLayout()
-        self.size = QSpinBox(); self.size.setRange(28, 64); self.size.setValue(28)
-        self.epochs = QSpinBox(); self.epochs.setRange(1, 20); self.epochs.setValue(8)
-        self.model_list = QComboBox()
-        self.refresh_models()
-        
-        self.btn_train = QPushButton("Train New Model")
-        self.btn_load = QPushButton("Load Model")
-        self.btn_clear = QPushButton("Clear Canvas")
-        
-        for w in [QLabel("Img Size:"), self.size, QLabel("Epochs:"), self.epochs, self.model_list, self.btn_train, self.btn_load, self.btn_clear]:
-            controls.addWidget(w)
-        main_layout.addLayout(controls)
-        
-        self.setLayout(main_layout)
-        self.model = None
-        self.img_size = 28
-        
-        self.btn_train.clicked.connect(self.start_training)
-        self.btn_load.clicked.connect(self.load_selected)
-        self.btn_clear.clicked.connect(self.reset_all)
-
-    def refresh_models(self):
-        self.model_list.clear()
-        if os.path.exists(MODELS_DIR):
-            self.model_list.addItems([f for f in os.listdir(MODELS_DIR) if f.endswith(".npz")])
-
-    def start_training(self):
-        self.btn_train.setEnabled(False)
-        self.img_size = self.size.value()
-        self.train_thread = TrainThread(self.img_size, self.epochs.value())
-        self.train_thread.progress.connect(self.progress_bar.setValue)
-        self.train_thread.finished_train.connect(self.on_training_finished)
-        self.train_thread.start()
-
-    def on_training_finished(self, trained_model):
-        self.model = trained_model
-        save_npz(self.model, os.path.join(MODELS_DIR, f"mnist_{self.img_size}px_{self.epochs.value()}ep.npz"), self.img_size)
-        self.refresh_models()
-        self.btn_train.setEnabled(True)
-
-    def load_selected(self):
-        name = self.model_list.currentText()
-        if name:
-            self.model, self.img_size = load_npz(os.path.join(MODELS_DIR, name))
-            self.size.setValue(self.img_size)
-
-    def realtime_predict(self):
-        if not self.model: return
-        # Görüntü işleme
-        img = center_image(self.draw.pil_img)
-        img = img.resize((self.img_size, self.img_size), Image.Resampling.LANCZOS)
-        
-        # Önce Tensor'e çevir [1, H, W]
-        t = transforms.ToTensor()(img)
-        # Görüntü formundayken normalize et
-        t = transforms.Normalize((0.1307,), (0.3081,))(t)
-        # Sonra düzleştir [1, input_size]
-        t = t.view(1, -1)
-        
-        with torch.no_grad():
-            out, acts = self.model(t, return_activations=True)
-            probs = torch.softmax(out, dim=1).numpy()[0]
-            self.viz.update_probs(int(np.argmax(probs)), probs)
-            self.net_viz.update_activations(acts)
-
-    def reset_all(self):
-        self.draw.clear(); self.viz.reset(); self.net_viz.reset()
-
-if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    window = Main()
-    window.show()
-    sys.exit(app.exec())
+if __name__ == "__main__": App().run()
